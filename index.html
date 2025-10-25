@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Round Robin CPU Scheduling</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h2>Round Robin CPU Scheduling</h2>
+    </header>
+
+    <div class="config-panel">
+      <div class="input-row">
+        <div class="input-group">
+          <label>Number of Processes</label>
+          <input type="number" id="numProcesses" min="1" max="8" value="5" />
+        </div>
+        <div class="input-group">
+          <label>Time Quantum</label>
+          <input type="number" id="timeQuantum" min="1" max="10" value="2" />
+        </div>
+        <div class="input-group">
+          <label>Mode</label>
+          <select id="mode">
+            <option value="single">Single Burst</option>
+            <option value="multiple">Multiple Bursts (up to 3 per process)</option>
+          </select>
+        </div>
+      </div>
+      <button class="btn generate-btn" onclick="generateProcessInputs()">Generate Table</button>
+    </div>
+
+    <div id="processInputs" class="process-inputs"></div>
+
+    <div id="startControls" class="controls" style="display: none;">
+      <button class="btn start-btn" onclick="startSimulation()">Start Simulation</button>
+    </div>
+
+    <!-- SIMULATION GRID -->
+    <div class="simulation-grid">
+      <div class="summary-section">
+        <h3>Process Summary</h3>
+        <div id="summaryTableContainer">
+          <div class="empty">Click "Start Simulation" to load</div>
+        </div>
+      </div>
+
+      <div class="queue-section">
+        <h3>Ready Queue</h3>
+        <div id="readyQueue" class="queue-container">
+          <div class="empty">No processes in queue</div>
+        </div>
+      </div>
+
+      <div class="execution-section">
+        <h3>Currently Executing</h3>
+        <div id="executingProcess" class="executing-box">
+          <div class="idle">CPU Idle</div>
+        </div>
+        <div class="status-bar">
+          <span id="statusText">Click "Start" to begin</span>
+          <span class="time">Time: <strong id="currentTime">0</strong></span>
+        </div>
+        <div class="control-buttons">
+          <button class="btn prev-btn" id="prevBtn" onclick="previousStep()" disabled>Previous</button>
+          <button class="btn step-btn" id="stepBtn" onclick="stepExecution()">Step</button>
+          <button class="btn play-btn" id="playPauseBtn" onclick="togglePlayPause()">Play</button>
+          <button class="btn reset-btn" onclick="resetSimulation()">Reset</button>
+        </div>
+      </div>
+
+      <div class="gantt-section">
+        <h3>Gantt Chart</h3>
+        <div id="ganttChart" class="gantt-container">
+          <div class="empty">Execution timeline will appear here</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- I/O QUEUE -->
+    <div class="io-section">
+      <h3>I/O Queue</h3>
+      <div id="ioQueue" class="io-container">
+        <div class="empty">No processes in I/O</div>
+      </div>
+    </div>
+
+    <!-- RESULTS -->
+    <div id="resultsSection" class="results-section" style="display: none;">
+      <h3>Simulation Results</h3>
+      <div class="stats-row">
+        <div class="stat-box">
+          <div class="label">Avg Waiting Time</div>
+          <div class="value" id="avgWaitTime">0.0</div>
+        </div>
+        <div class="stat-box">
+          <div class="label">Avg Turnaround Time</div>
+          <div class="value" id="avgTurnTime">0.0</div>
+        </div>
+      </div>
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th>Process</th>
+            <th>Arrival</th>
+            <th>Total Burst</th>
+            <th>Completion</th>
+            <th>Turnaround</th>
+            <th>Waiting</th>
+            <th>Response Time</th>
+
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </div>
+
+    <!-- FORMULAE AT BOTTOM -->
+    <div class="formulae-section">
+      <h3>Formulae Used</h3>
+      <div class="formula-card">
+        <div class="formula-label">Turnaround Time</div>
+        <div class="formula">TAT = C<sub>i</sub> − A<sub>i</sub></div>
+        <div class="formula-desc">Completion Time − Arrival Time</div>
+      </div>
+      <div class="formula-card">
+        <div class="formula-label">Waiting Time</div>
+        <div class="formula">WT = TAT − Total B<sub>i</sub></div>
+        <div class="formula-desc">Turnaround Time − Total Burst Time</div>
+      </div>
+      <div class="formula-card">
+        <div class="formula-label">Average Waiting Time</div>
+        <div class="formula">Avg WT = ΣWT / n</div>
+        <div class="formula-desc">Sum of all waiting times ÷ number of processes</div>
+      </div>
+      <div class="formula-card">
+        <div class="formula-label">Average Turnaround Time</div>
+        <div class="formula">Avg TAT = ΣTAT / n</div>
+        <div class="formula-desc">Sum of all turnaround times ÷ number of processes</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
