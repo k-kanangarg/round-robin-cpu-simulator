@@ -10,8 +10,8 @@ Interactive web-based simulator for **Round Robin (RR)** scheduling algorithm.
 - Responsive UI
 
 ## Live Demo
-[https://k-kananagr.github.io/round-robin-cpu-simulator/](https://k-kananagr.github.io/round-robin-cpu-simulator/)
-
+[[https://k-kananagr.github.io/round-robin-cpu-simulator/](https://k-kananagr.github.io/round-robin-cpu-simulator/)
+](https://k-kanangarg.github.io/round-robin-cpu-simulator/)
 ## How to Use
 1. Set number of processes & time quantum
 2. Choose mode
