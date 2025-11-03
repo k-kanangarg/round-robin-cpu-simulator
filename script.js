@@ -1,533 +1,572 @@
-let processes = [];
-let timeQuantum = 0;
-let currentTime = 0;
-let readyQueue = [];
-let ganttChart = [];
-let isPlaying = false;
-let intervalId = null;
-let currentExecuting = null;
-let quantumRemaining = 0;
-let history = [];
-let historyIndex = -1;
-let lastGanttProcess = null;
-let ioQueue = [];
+const processColors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#84cc16','#f97316','#6366f1'];
+function getProcessColor(id) {
+  const idx = (parseInt(id.replace('P','')) - 1);
+  return processColors[(idx % processColors.length + processColors.length) % processColors.length];
+}
+
+let readyQueue = [], ioQueue = [], ganttChart = [];
+let currentExecuting = null, quantumRemaining = 0;
+let isPlaying = false, intervalId = null;
+let history = [], historyIndex = -1;
+let executionTrace = [], contextSwitches = 0, cpuIdleTime = 0;
+let animationMultiplier = 1.0;
+const baseDelay = 800;
 let mode = 'single';
+let isInContextSwitch = false, contextSwitchEndTime = 0;
+let currentTime = 0, processes = [], timeQuantum = 0, contextSwitchTime = 0;
+let cpuWasIdle = true;
+let lastExecutedProcess = null;
 
-function deepClone(obj) {
-  return JSON.parse(JSON.stringify(obj));
+const get = id => document.getElementById(id);
+
+function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
+function addTrace(event) {
+  executionTrace.push({ time: currentTime, event });
 }
 
-// Helper: return an array of process IDs (or null)
-function idsFrom(arr) {
-  return (arr || []).map(p => (p ? p.id : null));
-}
-
-// Save state using IDs for queues to avoid object identity problems
 function saveState() {
   const state = {
-    currentTime,
-    processes: deepClone(processes), // canonical snapshot of processes
-    readyQueueIds: idsFrom(readyQueue),
-    ioQueueIds: idsFrom(ioQueue),
-    currentExecutingId: currentExecuting ? currentExecuting.id : null,
-    quantumRemaining,
-    ganttChart: deepClone(ganttChart),
-    lastGanttProcess: lastGanttProcess ? deepClone(lastGanttProcess) : null
+    currentTime, processes: deepClone(processes),
+    readyQueue: readyQueue.map(p => p.id),
+    ioQueue: ioQueue.map(p => p.id),
+    currentExecuting: currentExecuting ? currentExecuting.id : null,
+    quantumRemaining, ganttChart: deepClone(ganttChart),
+    contextSwitches, cpuIdleTime, executionTrace: deepClone(executionTrace),
+    isInContextSwitch, contextSwitchEndTime, cpuWasIdle, lastExecutedProcess
   };
-
   history = history.slice(0, historyIndex + 1);
   history.push(state);
   historyIndex++;
-  document.getElementById('prevBtn').disabled = historyIndex <= 0 ? true : false;
+  get('prevBtn').disabled = historyIndex === 0;
 }
 
-// Restore a snapshot: rebuild queues mapping ids to snapshot's processes
 function restoreState(state) {
+  if (!state) return;
   currentTime = state.currentTime;
-
-  // restore canonical processes from snapshot
   processes = deepClone(state.processes);
-
-  const findById = id => processes.find(p => p.id === id) || null;
-
-  readyQueue = (state.readyQueueIds || []).map(id => findById(id)).filter(Boolean);
-  ioQueue = (state.ioQueueIds || []).map(id => findById(id)).filter(Boolean);
-  currentExecuting = state.currentExecutingId ? findById(state.currentExecutingId) : null;
-
+  const find = id => processes.find(p => p.id === id);
+  readyQueue = (state.readyQueue || []).map(find).filter(Boolean);
+  ioQueue = (state.ioQueue || []).map(find).filter(Boolean);
+  currentExecuting = state.currentExecuting ? find(state.currentExecuting) : null;
   quantumRemaining = state.quantumRemaining;
   ganttChart = deepClone(state.ganttChart);
-  lastGanttProcess = state.lastGanttProcess ? deepClone(state.lastGanttProcess) : null;
-
+  contextSwitches = state.contextSwitches;
+  cpuIdleTime = state.cpuIdleTime;
+  executionTrace = deepClone(state.executionTrace);
+  isInContextSwitch = state.isInContextSwitch || false;
+  contextSwitchEndTime = state.contextSwitchEndTime || 0;
+  cpuWasIdle = state.cpuWasIdle;
+  lastExecutedProcess = state.lastExecutedProcess;
   updateDisplay();
 }
 
-function previousStep() {
-  if (isPlaying) togglePlayPause(); // prevent running timer during undo
-  if (historyIndex > 0) {
-    historyIndex--;
-    restoreState(history[historyIndex]);
-    document.getElementById('statusText').textContent = 'Step reversed';
-    document.getElementById('prevBtn').disabled = historyIndex <= 0;
-  }
+function updateBurstCountVisibility() {
+  const modeVal = get('mode').value;
+  get('burstCountRow').style.display = modeVal === 'multiple' ? 'flex' : 'none';
+  if (modeVal === 'single') get('burstCount').value = '3';
+  generateProcessInputs();
 }
 
 function generateProcessInputs() {
-  const num = Math.min(parseInt(document.getElementById('numProcesses').value) || 5, 8);
-  mode = document.getElementById('mode').value;
-  const container = document.getElementById('processInputs');
-
-  let processHeaders = '';
-  let arrivalRow = '';
-  let burstRows = '';
+  const num = Math.min(parseInt(get('numProcesses').value) || 5, 10);
+  mode = get('mode').value;
+  const maxBursts = mode === 'multiple' ? parseInt(get('burstCount').value) : 1;
+  const container = get('processInputs');
+  let html = '<table class="process-table-horizontal"><tr><th>PROCESS</th>';
+  for (let i = 0; i < num; i++) html += `<th>P${i + 1}</th>`;
+  html += '</tr><tr><th>ARRIVAL TIME</th>';
+  for (let i = 0; i < num; i++) html += `<td><input type="number" id="arrival${i}" min="0" value="${i}"></td>`;
+  html += '</tr>';
 
   if (mode === 'single') {
-    // Process headers
-    processHeaders = '<th>PROCESS</th>';
+    html += '<tr><th>BURST TIME</th>';
     for (let i = 0; i < num; i++) {
-      processHeaders += `<th>P${i + 1}</th>`;
+      const b = Math.floor(Math.random() * 8) + 3;
+      html += `<td><input type="number" id="burst1${i}" min="1" value="${b}"></td>`;
     }
-
-    // Arrival time row
-    arrivalRow = '<th>ARRIVAL TIME</th>';
-    for (let i = 0; i < num; i++) {
-      arrivalRow += `<td><input type="number" id="arrival${i}" min="0" value="${i}" /></td>`;
-    }
-
-    // Burst time row
-    burstRows = '<th>BURST TIME</th>';
-    for (let i = 0; i < num; i++) {
-      const burst = Math.floor(Math.random() * 8) + 3;
-      burstRows += `<td><input type="number" id="burst1${i}" min="1" value="${burst}" /></td>`;
-    }
-
-    container.innerHTML = `<table class="process-table-horizontal">
-      <tr>${processHeaders}</tr>
-      <tr>${arrivalRow}</tr>
-      <tr>${burstRows}</tr>
-    </table>`;
   } else {
-    // Process headers
-    processHeaders = '<th>PROCESS</th>';
-    for (let i = 0; i < num; i++) {
-      processHeaders += `<th>P${i + 1}</th>`;
+    for (let b = 1; b <= maxBursts; b++) {
+      html += `<tr><th>CPU BURST ${b}</th>`;
+      for (let i = 0; i < num; i++) {
+        const val = b === 1 ? Math.floor(Math.random() * 5) + 2 : Math.floor(Math.random() * 4) + 1;
+        html += `<td><input type="number" id="burst${b}${i}" min="0" value="${val}"></td>`;
+      }
+      html += '</tr>';
+      if (b < maxBursts) {
+        html += `<tr><th>I/O ${b}</th>`;
+        for (let i = 0; i < num; i++) {
+          html += `<td><input type="number" id="io${b}${i}" min="0" value="${Math.floor(Math.random() * 3) + 1}"></td>`;
+        }
+        html += '</tr>';
+      }
     }
-
-    // Arrival time row
-    arrivalRow = '<th>ARRIVAL TIME</th>';
-    for (let i = 0; i < num; i++) {
-      arrivalRow += `<td><input type="number" id="arrival${i}" min="0" value="${i}" /></td>`;
-    }
-
-    // CPU Burst 1 row
-    let burst1Row = '<th>CPU BURST 1</th>';
-    for (let i = 0; i < num; i++) {
-      const burst1 = Math.floor(Math.random() * 5) + 2;
-      burst1Row += `<td><input type="number" id="burst1${i}" min="1" value="${burst1}" /></td>`;
-    }
-
-    // I/O 1 row
-    let io1Row = '<th>I/O 1</th>';
-    for (let i = 0; i < num; i++) {
-      const io1 = Math.floor(Math.random() * 3) + 2;
-      io1Row += `<td><input type="number" id="io1${i}" min="0" value="${io1}" /></td>`;
-    }
-
-    // CPU Burst 2 row
-    let burst2Row = '<th>CPU BURST 2</th>';
-    for (let i = 0; i < num; i++) {
-      const burst2 = Math.floor(Math.random() * 4) + 1;
-      burst2Row += `<td><input type="number" id="burst2${i}" min="0" value="${burst2}" /></td>`;
-    }
-
-    // I/O 2 row
-    let io2Row = '<th>I/O 2</th>';
-    for (let i = 0; i < num; i++) {
-      const io2 = Math.floor(Math.random() * 3) + 1;
-      io2Row += `<td><input type="number" id="io2${i}" min="0" value="${io2}" /></td>`;
-    }
-
-    // CPU Burst 3 row
-    let burst3Row = '<th>CPU BURST 3</th>';
-    for (let i = 0; i < num; i++) {
-      const burst3 = Math.floor(Math.random() * 3) + 1;
-      burst3Row += `<td><input type="number" id="burst3${i}" min="0" value="${burst3}" /></td>`;
-    }
-
-    container.innerHTML = `<table class="process-table-horizontal">
-      <tr>${processHeaders}</tr>
-      <tr>${arrivalRow}</tr>
-      <tr>${burst1Row}</tr>
-      <tr>${io1Row}</tr>
-      <tr>${burst2Row}</tr>
-      <tr>${io2Row}</tr>
-      <tr>${burst3Row}</tr>
-    </table>`;
   }
-
-  document.getElementById('startControls').style.display = 'flex';
-  document.getElementById('summaryTableContainer').innerHTML = '<div class="empty">Click "Start Simulation" to load</div>';
+  html += '</table>';
+  container.innerHTML = html;
+  get('startControls').style.display = 'flex';
+  enableExports(false);
 }
 
 function startSimulation() {
-  const num = parseInt(document.getElementById('numProcesses').value);
-  timeQuantum = parseInt(document.getElementById('timeQuantum').value);
-  mode = document.getElementById('mode').value;
+  const num = parseInt(get('numProcesses').value);
+  timeQuantum = parseInt(get('timeQuantum').value);
+  contextSwitchTime = parseInt(get('contextSwitchTime').value);
+  const maxBursts = mode === 'multiple' ? parseInt(get('burstCount').value) : 1;
 
-  // --- Input validation ---
-  if (isNaN(num) || num < 1) return alert("Enter a valid number of processes.");
-  if (isNaN(timeQuantum) || timeQuantum <= 0) return alert("Time quantum must be ≥ 1.");
+  if (isNaN(num) || num < 1 || num > 10 || isNaN(timeQuantum) || timeQuantum < 1) {
+    return alert("Invalid input");
+  }
+  if (isNaN(contextSwitchTime) || contextSwitchTime < 0) {
+    return alert("Invalid context switch time");
+  }
 
-  processes = [];
-  ioQueue = [];
+  processes = []; readyQueue = []; ioQueue = []; ganttChart = [];
+  currentExecuting = null; quantumRemaining = 0;
+  history = []; historyIndex = -1; executionTrace = [];
+  contextSwitches = 0; cpuIdleTime = 0; cpuWasIdle = true;
+  isInContextSwitch = false; contextSwitchEndTime = 0;
+  currentTime = 0; lastExecutedProcess = null;
 
   for (let i = 0; i < num; i++) {
-    const arrival = parseInt(document.getElementById(`arrival${i}`).value);
-    const burst1 = parseInt(document.getElementById(`burst1${i}`).value);
-
-    if (burst1 <= 0) {
-      alert(`Process P${i + 1} has invalid burst time.`);
-      return;
-    }
-
-    let bursts = [burst1];
-    let ios = [];
-
-    if (mode === 'multiple') {
-      const io1 = parseInt(document.getElementById(`io1${i}`).value) || 0;
-      const burst2 = parseInt(document.getElementById(`burst2${i}`).value) || 0;
-      const io2 = parseInt(document.getElementById(`io2${i}`).value) || 0;
-      const burst3 = parseInt(document.getElementById(`burst3${i}`).value) || 0;
-
-      if (io1 > 0 && burst2 > 0) {
-        ios.push(io1);
-        bursts.push(burst2);
-      }
-      if (io2 > 0 && burst3 > 0) {
-        ios.push(io2);
-        bursts.push(burst3);
+    const arrival = parseInt(get(`arrival${i}`).value) || 0;
+    let bursts = [], ios = [];
+    if (mode === 'single') {
+      const b1 = parseInt(get(`burst1${i}`).value) || 0;
+      if (b1 > 0) bursts.push(b1);
+    } else {
+      for (let b = 1; b <= maxBursts; b++) {
+        const burst = parseInt(get(`burst${b}${i}`).value) || 0;
+        if (burst > 0) {
+          bursts.push(burst);
+          if (b < maxBursts) ios.push(parseInt(get(`io${b}${i}`).value) || 0);
+        }
       }
     }
-
-    const totalBurst = bursts.reduce((a, b) => a + b, 0);
-
-    const p = {
-      id: `P${i + 1}`,
-      arrivalTime: arrival,
-      bursts: bursts,
-      ios: ios,
-      currentBurstIndex: 0,
-      ioEndTime: -1,
-      remainingTime: bursts[0] || 0,
-      waitingTime: 0,
-      turnaroundTime: 0,
-      completionTime: 0,
-      totalBurst: totalBurst,
-      hasArrived: false,
-      isCompleted: false,
-      responseTime: null,
-      respondedOnce: false,
-    };
-
-    if (p.totalBurst <= 0) p.isCompleted = true;
-
-    processes.push(p);
+    const total = bursts.reduce((a, b) => a + b, 0);
+    if (total === 0) continue;
+    processes.push({
+      id: `P${i + 1}`, arrivalTime: arrival, bursts, ios,
+      currentBurstIndex: 0, ioEndTime: -1, remainingTime: bursts[0],
+      totalBurst: total, hasArrived: false, isCompleted: false,
+      responseTime: null, respondedOnce: false
+    });
   }
 
   processes.sort((a, b) => a.arrivalTime - b.arrivalTime);
-  currentTime = 0;
-  readyQueue = [];
-  ganttChart = [];
-  currentExecuting = null;
-  quantumRemaining = 0;
-  lastGanttProcess = null;
-  history = [];
-  historyIndex = -1;
-  document.getElementById('resultsSection').style.display = 'none';
-  document.getElementById('prevBtn').disabled = true;
+  get('resultsSection').style.display = 'none';
+  get('detailedStats').style.display = 'none';
 
-  // Enqueue processes that arrive at time 0 (they should be visible in ready queue)
-  processes.forEach(p => {
-    if (p.arrivalTime === 0) {
-      readyQueue.push(p);
-      p.hasArrived = true;
+  const firstArrival = processes.length ? processes[0].arrivalTime : 0;
+  if (firstArrival > 0) {
+    for (let t = 0; t < firstArrival; t++) {
+      addToGantt('IDLE', t, true);
+    }
+    cpuIdleTime += firstArrival;
+    currentTime = firstArrival;
+    addTrace(`CPU idle from t=0 to t=${firstArrival - 1}`);
+  }
+
+  processes.filter(p => p.arrivalTime <= currentTime).forEach(p => {
+    if (!p.hasArrived) {
+      readyQueue.push(p); p.hasArrived = true;
+      addTrace(`${p.id} arrived`);
     }
   });
 
-  // 🔧 Ensure we don't get stuck idle if all processes arrive later
-  if (readyQueue.length === 0) {
-    const earliest = Math.min(...processes.map(p => p.arrivalTime));
-    currentTime = earliest;
-    processes
-      .filter(p => p.arrivalTime === earliest)
-      .forEach(p => {
-        readyQueue.push(p);
-        p.hasArrived = true;
-      });
-  }
-
-  // Build Summary Table
-  let headerRow = '<tr><th>Process</th><th>Arrival</th><th>Total Burst</th></tr>';
+  const summary = get('summaryTableContainer');
   let rows = '';
-
   processes.forEach(p => {
     rows += `<tr><td>${p.id}</td><td>${p.arrivalTime}</td><td>${p.totalBurst}</td></tr>`;
   });
-
-  document.getElementById('summaryTableContainer').innerHTML = `<table class="process-table">${headerRow}<tbody>${rows}</tbody></table>`;
+  summary.innerHTML = `<table class="process-table"><tr><th>Process</th><th>Arrival</th><th>Total Burst</th></tr>${rows}</table>`;
 
   saveState();
   updateDisplay();
-  document.getElementById('statusText').textContent = 'Simulation started';
+  addTrace('Simulation started');
+  enableExports(false);
 }
 
-function addToGantt(id, startTime, isIdle = false) {
-  if (lastGanttProcess && lastGanttProcess.id === id && lastGanttProcess.isIdle === isIdle) {
-    // Extend the same block
-    lastGanttProcess.end = currentTime;
-    ganttChart[ganttChart.length - 1] = lastGanttProcess;
+function addToGantt(id, time, isIdle = false, isCS = false, explicitEnd = null) {
+  const last = ganttChart[ganttChart.length - 1];
+  const start = time;
+  const end = explicitEnd !== null ? explicitEnd : time + 1;
+
+  if (last && last.id === id && last.isIdle === isIdle && last.isContextSwitch === isCS && last.end === start) {
+    last.end = end;
   } else {
-    // Finalize previous block before adding new
-    const block = { id, start: startTime, end: currentTime, isIdle };
-    ganttChart.push(block);
-    lastGanttProcess = block;
+    ganttChart.push({ id, start, end, isIdle, isContextSwitch: isCS });
   }
 }
 
-function updateDisplay() {
-  document.getElementById('currentTime').textContent = currentTime;
+function startContextSwitch() {
+  if (mode !== 'multiple') return false;
+  if (contextSwitchTime <= 0) return false;
+  if (readyQueue.length === 0) return false;
+  if (cpuWasIdle) return false;
 
-  const queueDiv = document.getElementById('readyQueue');
-  queueDiv.innerHTML = readyQueue.length === 0
-    ? '<div class="empty">No processes in queue</div>'
-    : readyQueue.map(p => `
-      <div class="process-box">
-        <div class="process-name">${p.id}${mode === 'multiple' ? ` (B${p.currentBurstIndex + 1})` : ''}</div>
-        <div class="process-time">${p.remainingTime}/${p.bursts[p.currentBurstIndex]}</div>
-      </div>`).join('');
+  const nextProc = readyQueue[0];
+  if (lastExecutedProcess && nextProc.id === lastExecutedProcess.id) {
+    return false; // same process → no CS
+  }
 
-  const execDiv = document.getElementById('executingProcess');
-  execDiv.innerHTML = currentExecuting
-    ? `<div style="color:#1e40af;font-weight:600;">${currentExecuting.id}${mode === 'multiple' ? ` (Burst ${currentExecuting.currentBurstIndex + 1})` : ''}<br><small>${currentExecuting.remainingTime} unit(s) left</small></div>`
-    : '<div class="idle">CPU Idle</div>';
-
-  const ioDiv = document.getElementById('ioQueue');
-  ioDiv.innerHTML = ioQueue.length === 0
-    ? '<div class="empty">No processes in I/O</div>'
-    : ioQueue.map(p => `
-      <div class="io-box">
-        <div>${p.id}</div>
-        <div style="font-size: 0.75rem;">Until t=${p.ioEndTime}</div>
-      </div>`).join('');
-
-  const ganttDiv = document.getElementById('ganttChart');
-  ganttDiv.innerHTML = ganttChart.length === 0
-    ? '<div class="empty">Execution timeline will appear here</div>'
-    : ganttChart.map(entry => `
-      <div class="gantt-block ${entry.isIdle ? 'idle' : ''}" style="min-width: 40px;">
-        <div>${entry.id}</div>
-        <div class="gantt-time">${entry.start}</div>
-        <div class="gantt-time">${entry.end}</div>
-      </div>
-    `).join('');
+  isInContextSwitch = true;
+  contextSwitchEndTime = currentTime + contextSwitchTime;
+  contextSwitches++;
+  addTrace(`Context switch started (ends at t=${contextSwitchEndTime})`);
+  addToGantt('CS', currentTime, false, true, contextSwitchEndTime);
+  cpuWasIdle = false;
+  return true;
 }
 
 function stepExecution() {
-  // Save current state for undo
-  saveState();
+  if (processes.every(p => p.isCompleted)) { showResults(); return; }
 
-  // Process I/O completions first (those with ioEndTime <= currentTime)
-  const completedIO = [];
-  ioQueue.forEach((p, index) => {
-    if (p.ioEndTime !== -1 && p.ioEndTime <= currentTime) {
-      completedIO.push(index);
-    }
+  // === 1. ARRIVALS AT CURRENT TIME ===
+  processes.filter(p => p.arrivalTime === currentTime && !p.hasArrived).forEach(p => {
+    readyQueue.push(p); p.hasArrived = true;
+    addTrace(`${p.id} arrived`);
   });
 
-  completedIO.reverse().forEach(index => {
-    const p = ioQueue.splice(index, 1)[0];
-    p.currentBurstIndex++;
-    if (p.currentBurstIndex < p.bursts.length) {
-      p.remainingTime = p.bursts[p.currentBurstIndex];
-      readyQueue.push(p);
-      document.getElementById('statusText').textContent = `${p.id} returned from I/O (Burst ${p.currentBurstIndex + 1})`;
-    } else {
-      // Process completed after I/O
-      p.completionTime = currentTime;
-      p.turnaroundTime = p.completionTime - p.arrivalTime;
-      p.waitingTime = p.turnaroundTime - p.totalBurst;
-      p.isCompleted = true;
-      document.getElementById('statusText').textContent = `${p.id} completed after I/O`;
+  // === 2. I/O COMPLETION AT CURRENT TIME ===
+  if (mode === 'multiple') {
+    ioQueue = ioQueue.filter(p => {
+      if (p.ioEndTime === currentTime) {
+        p.currentBurstIndex++;
+        if (p.currentBurstIndex < p.bursts.length) {
+          p.remainingTime = p.bursts[p.currentBurstIndex];
+          readyQueue.push(p);
+          addTrace(`${p.id} completed I/O, back to ready`);
+          return false;
+        } else {
+          p.isCompleted = true;
+          p.completionTime = currentTime;
+          addTrace(`${p.id} completed`);
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+
+  // === 3. CONTEXT SWITCH IN PROGRESS ===
+  if (isInContextSwitch) {
+    if (currentTime + 1 >= contextSwitchEndTime) {
+      isInContextSwitch = false;
+      addTrace('Context switch completed');
+      if (readyQueue.length > 0) {
+        currentExecuting = readyQueue.shift();
+        quantumRemaining = timeQuantum;
+        if (!currentExecuting.respondedOnce) {
+          currentExecuting.responseTime = currentTime + 1 - currentExecuting.arrivalTime;
+          currentExecuting.respondedOnce = true;
+        }
+        addTrace(`${currentExecuting.id} loaded onto CPU`);
+        lastExecutedProcess = currentExecuting;
+        cpuWasIdle = false;
+      } else {
+        cpuWasIdle = true;
+      }
     }
-  });
+    currentTime++;
+    saveState();
+    updateDisplay();
+    return;
+  }
 
-  // Add newly arrived processes at this exact currentTime
-  processes.forEach(p => {
-    if (p.arrivalTime === currentTime && !p.hasArrived) {
-      readyQueue.push(p);
-      p.hasArrived = true;
-      document.getElementById('statusText').textContent = `${p.id} arrived`;
+  // === 4. NO PROCESS RUNNING → LOAD ONE OR JUMP ===
+  if (!currentExecuting) {
+    if (readyQueue.length > 0) {
+      const nextProc = readyQueue[0];
+
+      // Same process → no CS
+      if (lastExecutedProcess && nextProc.id === lastExecutedProcess.id) {
+        currentExecuting = readyQueue.shift();
+        quantumRemaining = timeQuantum;
+        if (!currentExecuting.respondedOnce) {
+          currentExecuting.responseTime = currentTime - currentExecuting.arrivalTime;
+          currentExecuting.respondedOnce = true;
+        }
+        addTrace(`${currentExecuting.id} resumed without context switch`);
+        lastExecutedProcess = currentExecuting;
+        cpuWasIdle = false;
+      }
+      // Different process → CS in multiple mode
+      else if (mode === 'multiple' && contextSwitchTime > 0) {
+        if (!startContextSwitch()) {
+          currentExecuting = readyQueue.shift();
+          quantumRemaining = timeQuantum;
+          if (!currentExecuting.respondedOnce) {
+            currentExecuting.responseTime = currentTime - currentExecuting.arrivalTime;
+            currentExecuting.respondedOnce = true;
+          }
+          lastExecutedProcess = currentExecuting;
+          addTrace(`${currentExecuting.id} started execution (no CS)`);
+          cpuWasIdle = false;
+        }
+      }
+      // Single mode or no CS
+      else {
+        currentExecuting = readyQueue.shift();
+        quantumRemaining = timeQuantum;
+        if (!currentExecuting.respondedOnce) {
+          currentExecuting.responseTime = currentTime - currentExecuting.arrivalTime;
+          currentExecuting.respondedOnce = true;
+        }
+        lastExecutedProcess = currentExecuting;
+        addTrace(`${currentExecuting.id} started execution`);
+        cpuWasIdle = false;
+      }
     }
-  });
+    else {
+      // === NO READY PROCESS → FIND NEXT EVENT ===
+      let nextEventTime = Infinity;
 
-  // Determine whether to pick a new process
-  if (!currentExecuting || quantumRemaining === 0) {
-    // If a process was executing and still has remainingTime, requeue it (preemption)
-    if (currentExecuting && currentExecuting.remainingTime > 0) {
-      readyQueue.push(currentExecuting);
-      currentExecuting = null;
-    }
+      // Next arrival
+      processes.forEach(p => {
+        if (!p.hasArrived && p.arrivalTime < nextEventTime) {
+          nextEventTime = p.arrivalTime;
+        }
+      });
 
-    // If nothing in ready queue, handle idle/time advance (I1: step-by-step idle)
-    if (readyQueue.length === 0) {
-      const allDone = processes.every(p => p.isCompleted === true);
-      const anyInIO = ioQueue.length > 0;
-
-      if (allDone && !anyInIO) {
-        return showResults();
+      // Next I/O
+      if (mode === 'multiple') {
+        ioQueue.forEach(p => {
+          if (p.ioEndTime < nextEventTime) {
+            nextEventTime = p.ioEndTime;
+          }
+        });
       }
 
-      const idleStart = currentTime;
-      currentTime++;
-      const remainingArrivals = processes.filter(p=>!p.hasArrived).map(p=>p.arrivalTime);
-      const nextArrival = remainingArrivals.length ? Math.min(...remainingArrivals) : Infinity;
-      addToGantt("Idle", idleStart, true);
-      document.getElementById('statusText').textContent =
-        `CPU Idle — next process arrives at t=${isFinite(nextArrival) ? nextArrival : currentTime}`;
-      updateDisplay();
-      return;
-    }
+      if (nextEventTime === Infinity) {
+        showResults();
+        return;
+      }
 
-    // Pick next process from ready queue
-    currentExecuting = readyQueue.shift();
-    quantumRemaining = Math.min(timeQuantum, currentExecuting.remainingTime);
-    document.getElementById('statusText').textContent =
-      `${currentExecuting.id} executing${mode === 'multiple' ? ` (Burst ${currentExecuting.currentBurstIndex + 1})` : ''}`;
-    // Record response time (only first time the process ever gets CPU)
-    if (currentExecuting.responseTime === null && !currentExecuting.respondedOnce) {
-      currentExecuting.responseTime = currentTime - currentExecuting.arrivalTime;
-      currentExecuting.respondedOnce = true;
+      // === ONLY JUMP IF NO PROCESSES IN READY QUEUE ===
+      if (nextEventTime > currentTime) {
+        const hasIO = mode === 'multiple' && ioQueue.length > 0;
+        if (!hasIO) {
+          for (let t = currentTime; t < nextEventTime; t++) {
+            addToGantt('IDLE', t, true);
+            cpuIdleTime++;
+          }
+          addTrace(`CPU idle from t=${currentTime} to t=${nextEventTime - 1}`);
+        } else {
+          addTrace(`Time advances to t=${nextEventTime} (processes in I/O)`);
+        }
+        currentTime = nextEventTime;
+        saveState();
+        updateDisplay();
+        return;
+      }
     }
   }
 
-  // Execute for one time unit
-  const execStart = currentTime;
-  currentExecuting.remainingTime--;
-  quantumRemaining--;
-  currentTime++;
-  addToGantt(currentExecuting.id, execStart, false);
+  // === 5. EXECUTE ONE TICK ===
+  if (quantumRemaining > 0 && currentExecuting && currentExecuting.remainingTime > 0) {
+    addToGantt(currentExecuting.id, currentTime);
+    currentExecuting.remainingTime--;
+    quantumRemaining--;
+    lastExecutedProcess = currentExecuting;
+    cpuWasIdle = false;
+  }
 
-  // Check if current burst finished
-  if (currentExecuting.remainingTime === 0) {
-    if (currentExecuting.currentBurstIndex < currentExecuting.bursts.length - 1) {
-      // Has more bursts -> move to I/O
-      currentExecuting.ioEndTime = currentTime + currentExecuting.ios[currentExecuting.currentBurstIndex];
+  // === 6. BURST COMPLETED ===
+  if (currentExecuting && currentExecuting.remainingTime === 0) {
+    if (mode === 'multiple' && currentExecuting.currentBurstIndex < currentExecuting.bursts.length - 1) {
+      const ioTime = currentExecuting.ios[currentExecuting.currentBurstIndex] || 0;
+      currentExecuting.ioEndTime = currentTime + 1 + ioTime;
       ioQueue.push(currentExecuting);
-      document.getElementById('statusText').textContent =
-        `${currentExecuting.id} moved to I/O (${currentExecuting.ios[currentExecuting.currentBurstIndex]} units)`;
+      addTrace(`${currentExecuting.id} sent to I/O (ends t=${currentExecuting.ioEndTime})`);
     } else {
-      // Last burst completed -> process done
-      currentExecuting.completionTime = currentTime;
-      currentExecuting.turnaroundTime = currentExecuting.completionTime - currentExecuting.arrivalTime;
-      currentExecuting.waitingTime = currentExecuting.turnaroundTime - currentExecuting.totalBurst;
       currentExecuting.isCompleted = true;
-      document.getElementById('statusText').textContent = `${currentExecuting.id} completed`;
+      currentExecuting.completionTime = currentTime + 1;
+      addTrace(`${currentExecuting.id} completed at t=${currentExecuting.completionTime}`);
     }
     currentExecuting = null;
-    lastGanttProcess = null;
-  } else if (quantumRemaining === 0) {
-    // Quantum expired but not finished -> requeue
+  }
+  // === 7. QUANTUM EXPIRED ===
+  else if (quantumRemaining === 0) {
     readyQueue.push(currentExecuting);
+    addTrace(`${currentExecuting.id} preempted (quantum expired)`);
     currentExecuting = null;
-    lastGanttProcess = null;
   }
 
-  // 🔧 FIX: Immediately pick next if CPU freed and ready queue has processes (for visual seamlessness)
-  // This sets executing for display but doesn't advance time—next step executes.
-  if (!currentExecuting && readyQueue.length > 0) {
-    currentExecuting = readyQueue.shift();
-    quantumRemaining = Math.min(timeQuantum, currentExecuting.remainingTime);
-    document.getElementById('statusText').textContent = `Switching to ${currentExecuting.id}${mode === 'multiple' ? ` (Burst ${currentExecuting.currentBurstIndex + 1})` : ''}`;
-    if (currentExecuting.responseTime === null && !currentExecuting.respondedOnce) {
-      currentExecuting.responseTime = currentTime - currentExecuting.arrivalTime;
-      currentExecuting.respondedOnce = true;
-    }
-    // Update display immediately to show the switch (no time advance)
-    const execDiv = document.getElementById('executingProcess');
-    execDiv.innerHTML = `<div style="color:#1e40af;font-weight:600;">${currentExecuting.id}${mode === 'multiple' ? ` (Burst ${currentExecuting.currentBurstIndex + 1})` : ''}<br><small>${currentExecuting.remainingTime} unit(s) left</small></div>`;
-  }
-
+  currentTime++;
+  saveState();
   updateDisplay();
 
-  // Check if finished globally
-  if (processes.every(p => p.isCompleted === true)) {
-    showResults();
+  if (processes.every(p => p.isCompleted)) showResults();
+}
+
+function updateGantt() {
+  const container = get('ganttChart');
+  container.innerHTML = ganttChart.map(b => {
+    const w = (b.end - b.start) * 40;
+    let cls = 'gantt-block', bg = '';
+    if (b.isContextSwitch) { cls += ' context-switch'; bg = '#fbbf24'; }
+    else if (b.isIdle) { cls += ' idle'; bg = '#e5e7eb'; }
+    else bg = getProcessColor(b.id);
+    return `<div class="${cls}" style="width:${w}px;background:${bg}">
+      <div class="gantt-time">${b.start}</div>
+      <div class="gantt-label">${b.id}</div>
+      <div class="gantt-time">${b.end}</div>
+    </div>`;
+  }).join('');
+}
+
+function updateDisplay() {
+  get('currentTime').textContent = currentTime;
+  get('readyQueue').innerHTML = readyQueue.length
+    ? readyQueue.map(p => `<div class="process-box">${p.id}<br><small>${p.remainingTime}</small></div>`).join('')
+    : '<div class="empty">No processes</div>';
+  get('ioQueue').innerHTML = ioQueue.length
+    ? ioQueue.map(p => `<div class="io-box">${p.id}<br><small>ends t=${p.ioEndTime}</small></div>`).join('')
+    : '<div class="empty">No processes</div>';
+
+  const exec = get('executingProcess');
+  if (isInContextSwitch) {
+    exec.innerHTML = `<div style="color:#f59e0b;">Context Switch<br><small>ends t=${contextSwitchEndTime}</small></div>`;
+  } else if (currentExecuting) {
+    exec.innerHTML = `<div style="color:#1e40af;">${currentExecuting.id}<br><small>${currentExecuting.remainingTime} left</small></div>`;
+  } else {
+    exec.innerHTML = '<div class="idle">CPU Idle</div>';
   }
+
+  updateGantt();
 }
 
 function togglePlayPause() {
   isPlaying = !isPlaying;
-  const btn = document.getElementById('playPauseBtn');
-  const stepBtn = document.getElementById('stepBtn');
-
+  get('playPauseBtn').textContent = isPlaying ? 'Pause' : 'Play';
+  get('stepBtn').disabled = isPlaying;
+  get('prevBtn').disabled = isPlaying || historyIndex === 0;
   if (isPlaying) {
-    btn.textContent = 'Pause';
-    stepBtn.disabled = true;
-    document.getElementById('prevBtn').disabled = true;
-    intervalId = setInterval(stepExecution, 800);
+    const delay = Math.max(20, Math.round(baseDelay / animationMultiplier));
+    intervalId = setInterval(stepExecution, delay);
   } else {
-    btn.textContent = 'Play';
-    stepBtn.disabled = false;
-    document.getElementById('prevBtn').disabled = historyIndex <= 0;
     clearInterval(intervalId);
+  }
+}
+
+function previousStep() {
+  if (isPlaying) togglePlayPause();
+  if (historyIndex > 0) {
+    historyIndex--;
+    restoreState(history[historyIndex]);
   }
 }
 
 function showResults() {
   if (isPlaying) togglePlayPause();
-  document.getElementById('resultsSection').style.display = 'block';
+  get('resultsSection').style.display = 'block';
+  get('detailedStats').style.display = 'block';
+  enableExports(true);
 
   const valid = processes.filter(p => p.totalBurst > 0);
-  const totalWait = valid.reduce((sum, p) => sum + p.waitingTime, 0);
-  const totalTurn = valid.reduce((sum, p) => sum + p.turnaroundTime, 0);
+  const totalWT = valid.reduce((s, p) => s + (p.completionTime - p.arrivalTime - p.totalBurst), 0);
+  const totalTAT = valid.reduce((s, p) => s + (p.completionTime - p.arrivalTime), 0);
 
-  document.getElementById('avgWaitTime').textContent = (totalWait / valid.length).toFixed(1);
-  document.getElementById('avgTurnTime').textContent = (totalTurn / valid.length).toFixed(1);
+  get('avgWaitTime').textContent = (totalWT / valid.length).toFixed(1);
+  get('avgTurnTime').textContent = (totalTAT / valid.length).toFixed(1);
 
-  const tbody = document.getElementById('resultsBody');
-  tbody.innerHTML = processes.map(p => `
-    <tr>
-      <td style="color:#1e40af;font-weight:600;">${p.id}</td>
-      <td>${p.arrivalTime}</td>
-      <td>${p.totalBurst}</td>
-      <td>${p.completionTime}</td>
-      <td>${p.turnaroundTime}</td>
-      <td>${p.waitingTime}</td>
-      <td>${p.responseTime !== null ? p.responseTime : '-'}</td>
-    </tr>
-  `).join('');
+  const tbody = get('resultsBody');
+  tbody.innerHTML = processes.map(p => `<tr>
+    <td>${p.id}</td><td>${p.arrivalTime}</td><td>${p.totalBurst}</td>
+    <td>${p.completionTime}</td><td>${p.completionTime - p.arrivalTime}</td>
+    <td>${p.completionTime - p.arrivalTime - p.totalBurst}</td>
+    <td>${p.responseTime !== null ? p.responseTime : '-'}</td>
+  </tr>`).join('');
 
-  document.getElementById('statusText').textContent = 'Simulation completed!';
+  const total = currentTime || 1;
+  get('statsGrid').innerHTML = `
+    <div class="stat-item"><div class="stat-label">Total Time</div><div class="stat-value">${total}</div></div>
+    <div class="stat-item"><div class="stat-label">CPU Utilization</div><div class="stat-value">${((total - cpuIdleTime) / total * 100).toFixed(1)}%</div></div>
+    <div class="stat-item"><div class="stat-label">Throughput</div><div class="stat-value">${(valid.length / total).toFixed(3)}</div></div>
+    <div class="stat-item"><div class="stat-label">Context Switches</div><div class="stat-value">${contextSwitches}</div></div>
+    <div class="stat-item"><div class="stat-label">Total Idle Time</div><div class="stat-value">${cpuIdleTime}</div></div>
+  `;
+}
+
+function exportScreenshot() {
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:9999;';
+  modal.innerHTML = `
+    <div style="background:white;padding:30px;border-radius:12px;max-width:500px;box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+      <h3 style="margin:0 0 20px;text-align:center;color:#0369a1;">Export Screenshot</h3>
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <button id="expGantt" class="btn" style="background:#0284c7;color:white;">Gantt Chart</button>
+        <button id="expTable" class="btn" style="background:#059669;color:white;">Process Table</button>
+        <button id="expResults" class="btn" style="background:#7c3aed;color:white;">Results & Stats</button>
+        <button id="closeModal" class="btn" style="background:#64748b;color:white;margin-top:8px;">Cancel</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  get('expGantt').onclick = () => { modal.remove(); capture('.gantt-section', 'gantt'); };
+  get('expTable').onclick = () => { modal.remove(); capture('#processInputs', 'process-table'); };
+  get('expResults').onclick = () => {
+    modal.remove();
+    const temp = document.createElement('div');
+    temp.style.cssText = 'background:#f8fafc;padding:20px;';
+    temp.appendChild(get('resultsSection').cloneNode(true));
+    temp.appendChild(get('detailedStats').cloneNode(true));
+    document.body.appendChild(temp);
+    html2canvas(temp, {scale:2, backgroundColor:'#f8fafc'}).then(c => {
+      document.body.removeChild(temp);
+      downloadCanvas(c, 'results');
+    });
+  };
+  get('closeModal').onclick = () => modal.remove();
+  modal.onclick = e => e.target === modal && modal.remove();
+}
+
+function capture(selector, name) {
+  const el = typeof selector === 'string' ? document.querySelector(selector) : selector;
+  if (!el) return alert('Section not found');
+  html2canvas(el, {scale:2, backgroundColor:'#ffffff'}).then(c => downloadCanvas(c, name));
+}
+
+function downloadCanvas(canvas, name) {
+  const a = document.createElement('a');
+  a.href = canvas.toDataURL('image/png');
+  a.download = `${name}-${Date.now()}.png`;
+  a.click();
+}
+
+function enableExports(on) {
+  get('exportScreenshotBtn').disabled = !on && get('processInputs').innerHTML.trim() === '';
 }
 
 function resetSimulation() {
   if (isPlaying) togglePlayPause();
-
-  currentTime = 0;
-  readyQueue = [];
-  ganttChart = [];
-  currentExecuting = null;
-  quantumRemaining = 0;
-  ioQueue = [];
-  lastGanttProcess = null;
-  history = [];
-  historyIndex = -1;
-
-  document.getElementById('resultsSection').style.display = 'none';
-  document.getElementById('prevBtn').disabled = true;
-  document.getElementById('statusText').textContent = 'Click "Start" to begin';
-  document.getElementById('summaryTableContainer').innerHTML = '<div class="empty">Click "Start Simulation" to load</div>';
-
+  currentTime = 0; readyQueue = []; ioQueue = []; ganttChart = [];
+  currentExecuting = null; history = []; historyIndex = -1;
+  executionTrace = []; contextSwitches = 0; cpuIdleTime = 0;
+  isInContextSwitch = false; contextSwitchEndTime = 0; cpuWasIdle = true;
+  lastExecutedProcess = null;
+  get('resultsSection').style.display = 'none';
+  get('detailedStats').style.display = 'none';
   updateDisplay();
+  enableExports(false);
 }
 
-window.onload = () => generateProcessInputs();
+get('speedSlider').addEventListener('input', function () {
+  animationMultiplier = parseFloat(this.value);
+  get('speedValue').textContent = animationMultiplier.toFixed(2) + 'x';
+  if (isPlaying) {
+    clearInterval(intervalId);
+    intervalId = setInterval(stepExecution, Math.max(20, Math.round(baseDelay / animationMultiplier)));
+  }
+});
+
+window.onload = () => {
+  updateBurstCountVisibility();
+  get('startBtn').onclick = startSimulation;
+  get('playPauseBtn').onclick = togglePlayPause;
+  get('stepBtn').onclick = stepExecution;
+  get('prevBtn').onclick = previousStep;
+  get('resetBtn').onclick = resetSimulation;
+  get('exportScreenshotBtn').onclick = exportScreenshot;
+};
