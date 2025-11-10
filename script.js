@@ -187,13 +187,34 @@ function startSimulation() {
 }
 
 function addToGantt(id, time, isIdle = false, isCS = false, explicitEnd = null) {
-  const last = ganttChart[ganttChart.length - 1];
   const start = time;
   const end = explicitEnd !== null ? explicitEnd : time + 1;
-
+  
+  if (ganttChart.length === 0) {
+    ganttChart.push({ id, start, end, isIdle, isContextSwitch: isCS });
+    return;
+  }
+  
+  const last = ganttChart[ganttChart.length - 1];
+  
+  // Merge with previous block if it's the same process/idle/CS and contiguous
   if (last && last.id === id && last.isIdle === isIdle && last.isContextSwitch === isCS && last.end === start) {
     last.end = end;
   } else {
+    // Check for gaps - if there's a gap, fill it with IDLE blocks
+    // In multiple bursts mode, only fill gaps at the start (before any process executes)
+    // In single mode, always fill gaps
+    if (last && last.end < start) {
+      const hasProcessExecuted = ganttChart.some(block => !block.isIdle && !block.isContextSwitch);
+      const shouldFillGap = mode === 'single' || !hasProcessExecuted;
+      
+      if (shouldFillGap) {
+        for (let t = last.end; t < start; t++) {
+          ganttChart.push({ id: 'IDLE', start: t, end: t + 1, isIdle: true, isContextSwitch: false });
+          cpuIdleTime++; // Count the gap time as idle
+        }
+      }
+    }
     ganttChart.push({ id, start, end, isIdle, isContextSwitch: isCS });
   }
 }
@@ -343,19 +364,24 @@ function stepExecution() {
       }
 
       // === ONLY JUMP IF NO PROCESSES IN READY QUEUE ===
-      if (nextEventTime > currentTime) {
-        const hasIO = mode === 'multiple' && ioQueue.length > 0;
-        if (!hasIO) {
+        if (nextEventTime > currentTime) {
+        // In multiple bursts mode, don't add idle blocks during execution
+        // Only add idle blocks at the start (handled in startSimulation)
+        // In single mode, add idle blocks to keep Gantt continuous
+        const idleDuration = nextEventTime - currentTime;
+        if (mode === 'single') {
           for (let t = currentTime; t < nextEventTime; t++) {
             addToGantt('IDLE', t, true);
             cpuIdleTime++;
           }
           addTrace(`CPU idle from t=${currentTime} to t=${nextEventTime - 1}`);
         } else {
-          addTrace(`Time advances to t=${nextEventTime} (processes in I/O)`);
+          // In multiple bursts mode, track idle time but don't show idle blocks
+          cpuIdleTime += idleDuration;
+          addTrace(`CPU idle from t=${currentTime} to t=${nextEventTime - 1} (not shown in Gantt)`);
         }
         currentTime = nextEventTime;
-        saveState();
+       saveState();
         updateDisplay();
         return;
       }
@@ -386,7 +412,7 @@ function stepExecution() {
     currentExecuting = null;
   }
   // === 7. QUANTUM EXPIRED ===
-  else if (quantumRemaining === 0) {
+  else if (quantumRemaining === 0 && currentExecuting) {
     readyQueue.push(currentExecuting);
     addTrace(`${currentExecuting.id} preempted (quantum expired)`);
     currentExecuting = null;
@@ -401,8 +427,12 @@ function stepExecution() {
 
 function updateGantt() {
   const container = get('ganttChart');
+  if (ganttChart.length === 0) {
+    container.innerHTML = '<div class="empty">Execution timeline will appear here</div>';
+    return;
+  }
   container.innerHTML = ganttChart.map(b => {
-    const w = (b.end - b.start) * 40;
+    const w = Math.max((b.end - b.start) * 40, 40); // Minimum width of 40px
     let cls = 'gantt-block', bg = '';
     if (b.isContextSwitch) { cls += ' context-switch'; bg = '#fbbf24'; }
     else if (b.isIdle) { cls += ' idle'; bg = '#e5e7eb'; }
@@ -418,11 +448,14 @@ function updateGantt() {
 function updateDisplay() {
   get('currentTime').textContent = currentTime;
   get('readyQueue').innerHTML = readyQueue.length
-    ? readyQueue.map(p => `<div class="process-box">${p.id}<br><small>${p.remainingTime}</small></div>`).join('')
-    : '<div class="empty">No processes</div>';
+    ? readyQueue.map(p => {
+        const remaining = p.remainingTime !== undefined ? p.remainingTime : (p.bursts && p.bursts[p.currentBurstIndex] ? p.bursts[p.currentBurstIndex] : 0);
+        return `<div class="process-box">${p.id}<br><small>${remaining}</small></div>`;
+      }).join('')
+    : '<div class="empty">No processes in queue</div>';
   get('ioQueue').innerHTML = ioQueue.length
     ? ioQueue.map(p => `<div class="io-box">${p.id}<br><small>ends t=${p.ioEndTime}</small></div>`).join('')
-    : '<div class="empty">No processes</div>';
+    : '<div class="empty">No processes in I/O</div>';
 
   const exec = get('executingProcess');
   if (isInContextSwitch) {
