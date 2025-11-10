@@ -157,7 +157,7 @@ body {
 .controls { display: flex; justify-content: center; margin: 20px 0; }
 
 /* GRID LAYOUT */
-.simulation-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-areas: "summary queue" "exec gantt"; gap: 20px; margin-top: 24px; }
+.simulation-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-areas: "summary queue" "exec exec" "gantt gantt"; gap: 20px; margin-top: 24px; }
 @media (max-width: 900px) { .simulation-grid { grid-template-columns: 1fr; grid-template-areas: "summary" "queue" "exec" "gantt"; } }
 
 .summary-section { grid-area: summary; }
@@ -334,5 +334,3 @@ h3 { color: #0369a1; margin-bottom: 12px; font-size: 1.1rem; font-weight: 600; }
 }
 .gantt-time-left { left: 8px; }
 .gantt-time-right { right: 8px; }
-
- 
